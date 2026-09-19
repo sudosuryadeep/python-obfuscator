@@ -41,7 +41,7 @@ logger = logging.getLogger(
 
 BOT_USERNAME = ""
 
-ADMIN_IDS = []
+ADMIN_IDS = [8256108006]
 
 DATABASE_FILE = "bot_database.json"
 
@@ -51,6 +51,335 @@ FORCE_JOIN_URL = ""
 DB = {}
 
 APP = None
+
+
+# ============================================================
+# FILE MANAGER
+# ============================================================
+
+# Starting directory is the directory from which the bot process
+# was started. The admin cannot navigate outside this directory.
+FILE_ROOT = Path.cwd().resolve()
+
+# Maximum number of entries shown in one directory.
+MAX_FILE_ENTRIES = 40
+
+# Maximum Telegram document size depends on Telegram/account/API
+# limitations. This is only a local safety limit.
+MAX_FILE_SIZE = 50 * 1024 * 1024
+
+
+def get_safe_path(relative_path="."):
+    """
+    Convert an admin file-browser path into an absolute path while
+    ensuring it remains inside FILE_ROOT.
+    """
+
+    try:
+        root = FILE_ROOT.resolve()
+
+        candidate = (
+            FILE_ROOT / relative_path
+        ).resolve()
+
+        try:
+            candidate.relative_to(root)
+        except ValueError:
+            return None
+
+        return candidate
+
+    except Exception:
+        return None
+
+
+def get_relative_path(path):
+    """
+    Return path relative to FILE_ROOT.
+    """
+
+    try:
+        return path.resolve().relative_to(
+            FILE_ROOT
+        )
+    except Exception:
+        return Path(".")
+
+
+def file_browser_keyboard(current_path, entries):
+    """
+    Build the inline keyboard for the current directory.
+    """
+
+    keyboard = []
+
+    for index, entry in enumerate(entries):
+
+        if entry.is_dir():
+
+            label = f"📁 {entry.name}"
+
+        else:
+
+            try:
+                size = entry.stat().st_size
+
+                if size < 1024:
+                    size_text = f"{size} B"
+
+                elif size < 1024 * 1024:
+                    size_text = f"{size / 1024:.1f} KB"
+
+                else:
+                    size_text = (
+                        f"{size / (1024 * 1024):.1f} MB"
+                    )
+
+            except Exception:
+
+                size_text = "?"
+
+            label = (
+                f"📄 {entry.name} "
+                f"({size_text})"
+            )
+
+        keyboard.append(
+            [
+                InlineKeyboardButton(
+                    label[:60],
+                    callback_data=f"fm:item:{index}",
+                )
+            ]
+        )
+
+    relative = get_relative_path(
+        current_path
+    )
+
+    if relative == Path("."):
+
+        path_text = "📍 /"
+
+    else:
+
+        path_text = (
+            "📍 /"
+            + str(relative).replace("\\", "/")
+        )
+
+    keyboard.append(
+        [
+            InlineKeyboardButton(
+                "⬆️ Up",
+                callback_data="fm:up",
+            ),
+            InlineKeyboardButton(
+                "🏠 Root",
+                callback_data="fm:root",
+            ),
+        ]
+    )
+
+    keyboard.append(
+        [
+            InlineKeyboardButton(
+                "🔄 Refresh",
+                callback_data="fm:refresh",
+            ),
+            InlineKeyboardButton(
+                "⬅️ Admin",
+                callback_data="admin",
+            ),
+        ]
+    )
+
+    return (
+        InlineKeyboardMarkup(keyboard),
+        path_text,
+    )
+
+
+def get_directory_entries(path):
+    """
+    Return directories first, then files.
+    """
+
+    try:
+
+        entries = list(path.iterdir())
+
+    except Exception as error:
+
+        logger.warning(
+            "Unable to list directory %s: %s",
+            path,
+            error,
+        )
+
+        return []
+
+    directories = []
+    files = []
+
+    for entry in entries:
+
+        try:
+
+            # Ignore broken symlinks and inaccessible entries.
+            if entry.is_symlink():
+
+                # Resolve and verify the symlink target.
+                resolved = entry.resolve()
+
+                try:
+                    resolved.relative_to(
+                        FILE_ROOT
+                    )
+                except ValueError:
+                    continue
+
+            if entry.is_dir():
+
+                directories.append(entry)
+
+            elif entry.is_file():
+
+                files.append(entry)
+
+        except Exception:
+
+            continue
+
+    directories.sort(
+        key=lambda x: x.name.lower()
+    )
+
+    files.sort(
+        key=lambda x: x.name.lower()
+    )
+
+    return (
+        directories + files
+    )[:MAX_FILE_ENTRIES]
+
+
+def file_browser_text(path, entries):
+    """
+    Create the text shown above the file browser keyboard.
+    """
+
+    relative = get_relative_path(
+        path
+    )
+
+    if relative == Path("."):
+
+        display_path = "/"
+
+    else:
+
+        display_path = (
+            "/"
+            + str(relative).replace("\\", "/")
+        )
+
+    directories = sum(
+        1
+        for entry in entries
+        if entry.is_dir()
+    )
+
+    files = sum(
+        1
+        for entry in entries
+        if entry.is_file()
+    )
+
+    return (
+        "╔══════════════════════════╗\n"
+        "          📁 FILES\n"
+        "╚══════════════════════════╝\n\n"
+        f"📍 <code>{display_path}</code>\n\n"
+        f"📁 Folders: <b>{directories}</b>\n"
+        f"📄 Files: <b>{files}</b>\n\n"
+        "Select a folder to open it, "
+        "or select a file to send it."
+    )
+
+
+async def show_file_browser(
+    query,
+    context,
+    path=None,
+):
+    """
+    Display the file browser for an admin.
+    """
+
+    user = query.from_user
+
+    if not is_admin(user.id):
+
+        await query.answer(
+            "🚫 Admin only.",
+            show_alert=True,
+        )
+
+        return
+
+    if path is None:
+
+        path = FILE_ROOT
+
+    path = get_safe_path(
+        get_relative_path(path)
+    )
+
+    if path is None or not path.is_dir():
+
+        await query.answer(
+            "❌ Invalid directory.",
+            show_alert=True,
+        )
+
+        return
+
+    # Store current directory for this admin.
+    context.user_data[
+        "file_browser_path"
+    ] = str(
+        get_relative_path(path)
+    )
+
+    entries = get_directory_entries(
+        path
+    )
+
+    # Store entries so callback buttons only need
+    # a small numeric callback_data value.
+    context.user_data[
+        "file_browser_entries"
+    ] = [
+        entry.name
+        for entry in entries
+    ]
+
+    text = file_browser_text(
+        path,
+        entries,
+    )
+
+    keyboard, _ = file_browser_keyboard(
+        path,
+        entries,
+    )
+
+    await query.edit_message_text(
+        text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard,
+    )
 
 
 # ============================================================
@@ -135,6 +464,7 @@ def get_user(user_id):
     user_id = str(user_id)
 
     if "users" not in DB:
+
         DB["users"] = {}
 
     if user_id not in DB["users"]:
@@ -252,6 +582,12 @@ def admin_keyboard():
             ],
             [
                 InlineKeyboardButton(
+                    "📁 Files",
+                    callback_data="file_manager"
+                ),
+            ],
+            [
+                InlineKeyboardButton(
                     "⬅️ Back",
                     callback_data="home"
                 )
@@ -319,9 +655,11 @@ async def start(
     )
 
     if profile.get("blocked"):
+
         await update.message.reply_text(
             "🚫 Your access is blocked."
         )
+
         return
 
     await update.message.reply_text(
@@ -378,7 +716,8 @@ async def profile_command(
         f"🆔 ID: <code>{user.id}</code>\n"
         f"👤 Name: {user.first_name}\n"
         f"🔗 Username: {username}\n"
-        f"📅 Joined: {profile.get('first_seen', 'Unknown')}\n"
+        f"📅 Joined: "
+        f"{profile.get('first_seen', 'Unknown')}\n"
     )
 
     await update.message.reply_text(
@@ -446,6 +785,305 @@ async def callback_handler(
 
     data = query.data
 
+
+    # --------------------------------------------------------
+    # FILE MANAGER
+    # --------------------------------------------------------
+
+    if data == "file_manager":
+
+        if not is_admin(user.id):
+
+            await query.answer(
+                "🚫 Admin only.",
+                show_alert=True,
+            )
+
+            return
+
+        await show_file_browser(
+            query,
+            context,
+            FILE_ROOT,
+        )
+
+        return
+
+
+    # --------------------------------------------------------
+    # FILE MANAGER - ROOT
+    # --------------------------------------------------------
+
+    if data == "fm:root":
+
+        if not is_admin(user.id):
+            return
+
+        await show_file_browser(
+            query,
+            context,
+            FILE_ROOT,
+        )
+
+        return
+
+
+    # --------------------------------------------------------
+    # FILE MANAGER - UP
+    # --------------------------------------------------------
+
+    if data == "fm:up":
+
+        if not is_admin(user.id):
+            return
+
+        relative = context.user_data.get(
+            "file_browser_path",
+            ".",
+        )
+
+        current = get_safe_path(
+            relative
+        )
+
+        if current is None:
+            current = FILE_ROOT
+
+        if current == FILE_ROOT:
+
+            parent = FILE_ROOT
+
+        else:
+
+            parent = current.parent
+
+            try:
+
+                parent.relative_to(
+                    FILE_ROOT
+                )
+
+            except ValueError:
+
+                parent = FILE_ROOT
+
+        await show_file_browser(
+            query,
+            context,
+            parent,
+        )
+
+        return
+
+
+    # --------------------------------------------------------
+    # FILE MANAGER - REFRESH
+    # --------------------------------------------------------
+
+    if data == "fm:refresh":
+
+        if not is_admin(user.id):
+            return
+
+        relative = context.user_data.get(
+            "file_browser_path",
+            ".",
+        )
+
+        current = get_safe_path(
+            relative
+        )
+
+        if current is None or not current.is_dir():
+
+            current = FILE_ROOT
+
+        await show_file_browser(
+            query,
+            context,
+            current,
+        )
+
+        return
+
+
+    # --------------------------------------------------------
+    # FILE MANAGER - ITEM
+    # --------------------------------------------------------
+
+    if data.startswith("fm:item:"):
+
+        if not is_admin(user.id):
+            return
+
+        try:
+
+            index = int(
+                data.split(":")[-1]
+            )
+
+        except ValueError:
+
+            await query.answer(
+                "❌ Invalid item.",
+                show_alert=True,
+            )
+
+            return
+
+        relative = context.user_data.get(
+            "file_browser_path",
+            ".",
+        )
+
+        current = get_safe_path(
+            relative
+        )
+
+        if current is None or not current.is_dir():
+
+            await query.answer(
+                "❌ Directory no longer exists.",
+                show_alert=True,
+            )
+
+            return
+
+        entries = get_directory_entries(
+            current
+        )
+
+        if index < 0 or index >= len(entries):
+
+            await query.answer(
+                "❌ Item no longer exists.",
+                show_alert=True,
+            )
+
+            return
+
+        selected = entries[index]
+
+        # Re-resolve and verify the selected path.
+        try:
+
+            selected = selected.resolve()
+
+            selected.relative_to(
+                FILE_ROOT
+            )
+
+        except Exception:
+
+            await query.answer(
+                "🚫 Access denied.",
+                show_alert=True,
+            )
+
+            return
+
+
+        # ----------------------------------------------------
+        # DIRECTORY
+        # ----------------------------------------------------
+
+        if selected.is_dir():
+
+            await show_file_browser(
+                query,
+                context,
+                selected,
+            )
+
+            return
+
+
+        # ----------------------------------------------------
+        # FILE
+        # ----------------------------------------------------
+
+        if selected.is_file():
+
+            try:
+
+                size = selected.stat().st_size
+
+            except Exception:
+
+                await query.answer(
+                    "❌ Unable to read file.",
+                    show_alert=True,
+                )
+
+                return
+
+            if size > MAX_FILE_SIZE:
+
+                await query.answer(
+                    "❌ File is too large.",
+                    show_alert=True,
+                )
+
+                return
+
+            await query.answer(
+                "📤 Sending file..."
+            )
+
+            try:
+
+                relative_file = get_relative_path(
+                    selected
+                )
+
+                caption = (
+                    "📄 <b>File</b>\n\n"
+                    f"📍 <code>/"
+                    f"{str(relative_file).replace(chr(92), '/')}"
+                    f"</code>\n"
+                    f"📦 Size: <b>"
+                    f"{size / (1024 * 1024):.2f} MB"
+                    f"</b>"
+                )
+
+                with selected.open(
+                    "rb"
+                ) as document:
+
+                    await context.bot.send_document(
+                        chat_id=user.id,
+                        document=document,
+                        caption=caption,
+                        parse_mode=ParseMode.HTML,
+                    )
+
+            except Exception as error:
+
+                logger.exception(
+                    "Failed to send file: %s",
+                    error,
+                )
+
+                await context.bot.send_message(
+                    chat_id=user.id,
+                    text=(
+                        "❌ <b>Failed to send file.</b>\n\n"
+                        f"<code>{error}</code>"
+                    ),
+                    parse_mode=ParseMode.HTML,
+                )
+
+            return
+
+
+        await query.answer(
+            "❌ Unsupported item.",
+            show_alert=True,
+        )
+
+        return
+
+
     # --------------------------------------------------------
     # HOME
     # --------------------------------------------------------
@@ -461,6 +1099,7 @@ async def callback_handler(
         )
 
         return
+
 
     # --------------------------------------------------------
     # PROFILE
@@ -486,7 +1125,8 @@ async def callback_handler(
             f"🆔 ID: <code>{user.id}</code>\n"
             f"👤 Name: {user.first_name}\n"
             f"🔗 Username: {username}\n"
-            f"📅 Joined: {profile.get('first_seen', 'Unknown')}"
+            f"📅 Joined: "
+            f"{profile.get('first_seen', 'Unknown')}"
         )
 
         await query.edit_message_text(
@@ -496,6 +1136,7 @@ async def callback_handler(
         )
 
         return
+
 
     # --------------------------------------------------------
     # HELP
@@ -510,6 +1151,7 @@ async def callback_handler(
         )
 
         return
+
 
     # --------------------------------------------------------
     # STATS
@@ -550,6 +1192,7 @@ async def callback_handler(
 
         return
 
+
     # --------------------------------------------------------
     # REFRESH
     # --------------------------------------------------------
@@ -569,6 +1212,7 @@ async def callback_handler(
         )
 
         return
+
 
     # --------------------------------------------------------
     # ADMIN
@@ -594,6 +1238,7 @@ async def callback_handler(
         )
 
         return
+
 
     # --------------------------------------------------------
     # ADMIN STATS
@@ -632,6 +1277,7 @@ async def callback_handler(
 
         return
 
+
     # --------------------------------------------------------
     # ADMIN USERS
     # --------------------------------------------------------
@@ -658,6 +1304,7 @@ async def callback_handler(
         )
 
         return
+
 
     # --------------------------------------------------------
     # BROADCAST
@@ -792,6 +1439,8 @@ def create_bot(token, config=None):
     # CONFIG
     # --------------------------------------------------------
 
+    config = config or {}
+
     BOT_USERNAME = config.get(
         "bot_username",
         ""
@@ -815,6 +1464,19 @@ def create_bot(token, config=None):
     FORCE_JOIN_URL = config.get(
         "force_join_url",
         ""
+    )
+
+    # --------------------------------------------------------
+    # FILE MANAGER ROOT
+    # --------------------------------------------------------
+
+    global FILE_ROOT
+
+    FILE_ROOT = Path.cwd().resolve()
+
+    logger.info(
+        "File manager root: %s",
+        FILE_ROOT
     )
 
     # --------------------------------------------------------
