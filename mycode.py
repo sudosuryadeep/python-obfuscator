@@ -779,7 +779,7 @@ async def cancel_command(
 # CREATE BOT
 # ============================================================
 
-def create_bot(token, config):
+def create_bot(token, config=None):
 
     global BOT_USERNAME
     global ADMIN_IDS
