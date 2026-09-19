@@ -1,5 +1,7 @@
 import json
 import logging
+import html
+import secrets
 from pathlib import Path
 from datetime import datetime
 
@@ -67,6 +69,30 @@ MAX_FILE_ENTRIES = 40
 # Maximum Telegram document size depends on Telegram/account/API
 # limitations. This is only a local safety limit.
 MAX_FILE_SIZE = 50 * 1024 * 1024
+
+# Files that should never be exposed through the Telegram file browser.
+# Add/remove patterns according to your deployment.
+BLOCKED_FILE_NAMES = {
+    ".env", ".env.local", ".env.production", 
+    "id_rsa", "id_ed25519", "credentials.json",
+}
+BLOCKED_FILE_SUFFIXES = {
+    ".pem", ".key", ".p12", ".pfx",
+}
+
+
+def is_safe_download_file(path):
+    """Return True only for regular files that are safe to expose."""
+    try:
+        name = path.name.lower()
+        if name in {x.lower() for x in BLOCKED_FILE_NAMES}:
+            return False
+        if path.suffix.lower() in BLOCKED_FILE_SUFFIXES:
+            return False
+        return path.is_file() and not path.is_symlink()
+    except Exception:
+        return False
+
 
 
 def get_safe_path(relative_path="."):
@@ -300,7 +326,7 @@ def file_browser_text(path, entries):
         "╔══════════════════════════╗\n"
         "          📁 FILES\n"
         "╚══════════════════════════╝\n\n"
-        f"📍 <code>{display_path}</code>\n\n"
+        f"📍 <code>{html.escape(display_path)}</code>\n\n"
         f"📁 Folders: <b>{directories}</b>\n"
         f"📄 Files: <b>{files}</b>\n\n"
         "Select a folder to open it, "
@@ -358,12 +384,18 @@ async def show_file_browser(
 
     # Store entries so callback buttons only need
     # a small numeric callback_data value.
+    # Store the exact resolved paths used to build this keyboard.
+    # The callback uses this snapshot, preventing a stale index from
+    # accidentally selecting a different file after a directory changes.
     context.user_data[
         "file_browser_entries"
-    ] = [
-        entry.name
-        for entry in entries
-    ]
+    ] = {
+        str(index): str(entry)
+        for index, entry in enumerate(entries)
+    }
+    context.user_data[
+        "file_browser_nonce"
+    ] = secrets.token_hex(8)
 
     text = file_browser_text(
         path,
@@ -609,7 +641,7 @@ def home_text(user):
         "        🤖 REMOTE BOT\n"
         "╚══════════════════════════╝\n\n"
 
-        f"👋 Hello, <b>{name}</b>!\n\n"
+        f"👋 Hello, <b>{html.escape(name)}</b>!\n\n"
 
         "This bot is running from the "
         "<b>remote mycode.py</b> file.\n\n"
@@ -714,7 +746,7 @@ async def profile_command(
         "╚══════════════════════════╝\n\n"
 
         f"🆔 ID: <code>{user.id}</code>\n"
-        f"👤 Name: {user.first_name}\n"
+        f"👤 Name: {html.escape(user.first_name or 'User')}\n"
         f"🔗 Username: {username}\n"
         f"📅 Joined: "
         f"{profile.get('first_seen', 'Unknown')}\n"
@@ -778,8 +810,6 @@ async def callback_handler(
 ):
 
     query = update.callback_query
-
-    await query.answer()
 
     user = query.from_user
 
@@ -949,37 +979,35 @@ async def callback_handler(
 
             return
 
-        entries = get_directory_entries(
-            current
+        # Use the exact entry snapshot that created the button.
+        # This avoids index drift when files are added/removed/renamed.
+        stored_entries = context.user_data.get(
+            "file_browser_entries",
+            {},
         )
+        stored_path = stored_entries.get(str(index))
 
-        if index < 0 or index >= len(entries):
-
+        if not stored_path:
             await query.answer(
-                "❌ Item no longer exists.",
+                "❌ This button has expired. Please refresh.",
                 show_alert=True,
             )
-
             return
 
-        selected = entries[index]
+        selected = Path(stored_path)
 
-        # Re-resolve and verify the selected path.
         try:
+            selected = selected.resolve(strict=True)
+            selected.relative_to(FILE_ROOT)
 
-            selected = selected.resolve()
-
-            selected.relative_to(
-                FILE_ROOT
-            )
+            # Ensure it is still directly under the directory that was shown.
+            selected.relative_to(current)
 
         except Exception:
-
             await query.answer(
-                "🚫 Access denied.",
+                "❌ Item no longer exists. Please refresh.",
                 show_alert=True,
             )
-
             return
 
 
@@ -1003,6 +1031,13 @@ async def callback_handler(
         # ----------------------------------------------------
 
         if selected.is_file():
+
+            if not is_safe_download_file(selected):
+                await query.answer(
+                    "🚫 This file type is blocked.",
+                    show_alert=True,
+                )
+                return
 
             try:
 
@@ -1039,7 +1074,7 @@ async def callback_handler(
                 caption = (
                     "📄 <b>File</b>\n\n"
                     f"📍 <code>/"
-                    f"{str(relative_file).replace(chr(92), '/')}"
+                    f"{html.escape(str(relative_file).replace(chr(92), '/'))}"
                     f"</code>\n"
                     f"📦 Size: <b>"
                     f"{size / (1024 * 1024):.2f} MB"
@@ -1068,7 +1103,7 @@ async def callback_handler(
                     chat_id=user.id,
                     text=(
                         "❌ <b>Failed to send file.</b>\n\n"
-                        f"<code>{error}</code>"
+                        f"<code>{html.escape(str(error))}</code>"
                     ),
                     parse_mode=ParseMode.HTML,
                 )
@@ -1123,7 +1158,7 @@ async def callback_handler(
             "╚══════════════════════════╝\n\n"
 
             f"🆔 ID: <code>{user.id}</code>\n"
-            f"👤 Name: {user.first_name}\n"
+            f"👤 Name: {html.escape(user.first_name or 'User')}\n"
             f"🔗 Username: {username}\n"
             f"📅 Joined: "
             f"{profile.get('first_seen', 'Unknown')}"
@@ -1423,6 +1458,30 @@ async def cancel_command(
 
 
 # ============================================================
+# ERROR HANDLER
+# ============================================================
+
+async def error_handler(update, context):
+    """Log unexpected handler errors without stopping polling."""
+    logger.error(
+        "Unhandled Telegram update error: %s",
+        context.error,
+        exc_info=(type(context.error), context.error, context.error.__traceback__)
+        if context.error else None,
+    )
+
+    try:
+        chat = getattr(update, "effective_chat", None)
+        if chat:
+            await context.bot.send_message(
+                chat_id=chat.id,
+                text="❌ Something went wrong while processing that request. Please try again.",
+            )
+    except Exception:
+        logger.exception("Could not send error notification")
+
+
+# ============================================================
 # CREATE BOT
 # ============================================================
 
@@ -1556,6 +1615,8 @@ def create_bot(token, config=None):
             message_handler
         )
     )
+
+    APP.add_error_handler(error_handler)
 
     logger.info(
         "Remote bot application created"
