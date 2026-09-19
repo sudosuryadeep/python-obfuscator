@@ -1,8 +1,6 @@
-# mycode.py
+print("🔥 HELLO FROM REMOTE SERVER")
 
-def run():
-    print("Hello from remote Python code!")
-    print("This code came from the website.")
+def test():
+    print("✅ Remote function is working")
 
-if __name__ == "__main__":
-    run()
+test()
