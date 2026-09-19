@@ -4,7 +4,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "✅ Bot logic is running from remote mycode.py"
+        "🔥 Bot is running from remote code!"
     )
 
 
